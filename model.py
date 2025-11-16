@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -8,6 +7,10 @@ import torch.nn.functional as F
 from PIL import Image
 
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:  # pragma: no cover - optional dep pre-4.30
+    BitsAndBytesConfig = None
 import open_clip
 
 from peft import LoraConfig, get_peft_model, TaskType
@@ -19,12 +22,11 @@ class ModelCfg:
     qdtype: torch.dtype = torch.bfloat16
     clip_arch: str = "ViT-L-14"
     clip_ckpt: str = "openai"
+    qwen_quant: str = "bnb-4bit"  # choices: none, bnb-8bit, bnb-4bit
 
     n_heads: int = 8
     n_layers: int = 1
     gate_init: float = 0.5
-
-    ###NOTE: Later add a chain-of-thought based answering capability and prompt
 
     ego_prompt: str = """Predict ego motion from time t to t+1 (dt ~ 0.5 s) in the VEHICLE frame.
         Coordinates: x_forward > 0 forward, y_left > 0 left, yaw_rad > 0 counterclockwise.
@@ -42,6 +44,7 @@ class ModelCfg:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_targets: tuple = ("q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj")
+    max_vis_tokens: Optional[int] = None
 
 class CLIPBackbone(nn.Module):
     def __init__(self, arch: str, ckpt: str, device: str):
@@ -93,26 +96,52 @@ class VisualTokenCatcher:
 
 
 class QwenVisionExtractor(nn.Module):
-    def __init__(self, qwen_id: str, device: str, dtype: torch.dtype):
+    def __init__(self, qwen_id: str, device: str, dtype: torch.dtype, quant_mode: str = "none"):
         super().__init__()
         self.device = device
+        load_kwargs = {"device_map": "auto"}
+        if quant_mode == "none":
+            load_kwargs["torch_dtype"] = dtype
+        else:
+            load_kwargs["quantization_config"] = self._build_bnb_config(dtype, quant_mode)
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            qwen_id, torch_dtype=dtype, device_map="auto"
+            qwen_id, **load_kwargs
         )
-        self.processor = AutoProcessor.from_pretrained(qwen_id)
+        self.processor = AutoProcessor.from_pretrained(qwen_id, use_fast=False)
         for p in self.model.parameters():
             p.requires_grad = False
         self.model.eval()
         self.d_model = self.model.config.hidden_size
+        self.quant_mode = quant_mode
+
+    def _build_bnb_config(self, dtype: torch.dtype, quant_mode: str):
+        if BitsAndBytesConfig is None:
+            raise ImportError(
+                "bitsandbytes is required for quantized Qwen loading; please install it or set --qwen-quant none."
+            )
+        qmode = quant_mode.lower()
+        if qmode == "bnb-4bit":
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_quant_type="nf4",
+            )
+        if qmode == "bnb-8bit":
+            return BitsAndBytesConfig(load_in_8bit=True)
+        raise ValueError(f"Unsupported quantization mode: {quant_mode}")
 
     @torch.no_grad()
     def visual_tokens(self, images: List[Image.Image]) -> torch.Tensor:
         catcher = VisualTokenCatcher(self.d_model)
         catcher.attach(self.model)
-        content = [{"type": "image", "image": im} for im in images]
+        content = [{"type": "image"} for _ in images]
         content.append({"type": "text", "text": "."})
         messages = [{"role": "user", "content": content}]
-        inputs = self.processor(messages=messages, return_tensors="pt").to(self.device)
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        inputs = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
         _ = self.model(**inputs)
         catcher.detach()
         vt = catcher.pick()  # (1, T, d)
@@ -149,57 +178,16 @@ class FusionConnector(nn.Module):
         return self.out_norm(fused)
 
 
-class AttnPool1D(nn.Module):
-    """Single-query multi-head attention pool over token axis (T -> 1).
-    Returns one d_model vector per timestep, order-aware but compact."""
-    def __init__(self, d_model: int, heads: int = 4):
-        super().__init__()
-        self.q = nn.Parameter(torch.randn(1, 1, d_model) / (d_model ** 0.5))
-        self.attn = nn.MultiheadAttention(d_model, heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B, T, d_model)
-        q = self.q.expand(x.size(0), -1, -1)            # (B, 1, d)
-        out, _ = self.attn(q, x, x)                     # (B, 1, d)
-        return self.norm(out.squeeze(1))                 # (B, d)
-
-
-class EgoMotionHead(nn.Module):
-    """Temporal ego-motion head with attention pooling per timestep.
-    1) AttnPool over tokens -> (B, d)
-    2) GRU over time L -> (B, d)
-    3) MLP -> (dx, dy, dyaw)
-    """
-    def __init__(self, d_model: int, hidden: int = 512, heads: int = 4):
-        super().__init__()
-        self.pool = AttnPool1D(d_model, heads=heads)
-        self.rnn = nn.GRU(input_size=d_model, hidden_size=d_model, num_layers=1, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden), nn.GELU(),
-            nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, 3)
-        )
-
-    def forward(self, token_seq: torch.Tensor) -> torch.Tensor:
-        # token_seq: (B, L, Tvis, d)
-        B, L, T, D = token_seq.shape
-        x = token_seq.view(B * L, T, D)                 # (B*L, T, d)
-        v = self.pool(x).view(B, L, D)                  # (B, L, d)
-        out, _ = self.rnn(v)
-        h = out[:, -1]
-        return self.mlp(h)  
-    
 class VLMFusionModel(nn.Module):
     def __init__(self, cfg: ModelCfg):
         super().__init__()
         self.cfg = cfg
-        self.qwen = QwenVisionExtractor(cfg.qwen_id, cfg.device, cfg.qdtype)
+        self.qwen = QwenVisionExtractor(cfg.qwen_id, cfg.device, cfg.qdtype, cfg.qwen_quant)
         self.tok = AutoTokenizer.from_pretrained(cfg.qwen_id)
         self.ext = CLIPBackbone(cfg.clip_arch, cfg.clip_ckpt, cfg.device)
         self.connector = FusionConnector(d_ext=self.ext.d_out, d_model=self.qwen.d_model,
                                          n_heads=cfg.n_heads, n_layers=cfg.n_layers, gate_init=cfg.gate_init)
         self.gen_model = self.qwen.model
-        self.ego_head = EgoMotionHead(d_model=self.qwen.d_model)
 
         if self.cfg.use_lora:
             peft_cfg = LoraConfig(
@@ -223,15 +211,16 @@ class VLMFusionModel(nn.Module):
 
     def fused_tokens(self, images: List[Image.Image]) -> torch.Tensor:
         with torch.no_grad():
-            q = self.teacher_tokens(images).to(self.cfg.device)  # (1, Tq, d)
-            e = self.ext_tokens(images).to(self.cfg.device)      # (1, Te, d_ext)
+            target_dtype = self.connector.in_proj.weight.dtype
+            q = self.teacher_tokens(images).to(self.cfg.device, dtype=target_dtype)  # (1, Tq, d)
+            e = self.ext_tokens(images).to(self.cfg.device, dtype=target_dtype)      # (1, Te, d_ext)
+            max_vis = self.cfg.max_vis_tokens
+            if max_vis is not None and max_vis > 0 and q.size(1) > max_vis:
+                q = q[:, :max_vis, :]
         return self.connector(q, e)  # (1, Tq, d)
 
     def llm_vis_hidden(self, images: List[Image.Image], prompt: Optional[str] = None):
-        """Run LLM on [fused_visual_prefix ; prompt] and return last-layer hidden states and visual length.
-        This makes the LLM fully participate; ego head reads features *after* the LLM.
-        Returns: (hidden: (1, S, d), vis_len: int)
-        """
+        """Run the LLM on [fused visual prefix ; prompt] and return final hidden states + visual length."""
         fused = self.fused_tokens(images)  # (1, T_vis, d)
         T_vis = fused.size(1)
         txt = (self.cfg.ego_prompt if prompt is None else prompt)
@@ -277,17 +266,3 @@ class VLMFusionModel(nn.Module):
                                           max_new_tokens=max_new_tokens, do_sample=False)
         return self.tok.batch_decode(out_ids, skip_special_tokens=True)[0]
     
-    def ego_tokens_seq(self, images_seq: List[List[Image.Image]]) -> torch.Tensor:
-        """Build a sequence of *LLM-layer* features corresponding to the visual prefix.
-        For each timestep: run LLM on [fused_vis ; ego_prompt] and take the last-layer
-        hidden states for the first T_vis positions (visual region)."""
-        toks = []
-        for ims in images_seq:
-            hidden, T_vis = self.llm_vis_hidden(ims, prompt=self.cfg.ego_prompt)  # (1, S, d), T_vis
-            vis_h = hidden[:, :T_vis, :]  # keep only visual segment after LLM
-            toks.append(vis_h)
-        return torch.stack(toks, dim=1)  # (1, L, T_vis, d)  # (1, L, T, d)
-
-    def ego_predict(self, images_seq: List[List[Image.Image]]) -> torch.Tensor:
-        tok_seq = self.ego_tokens_seq(images_seq)  # (1, L, T, d)
-        return self.ego_head(tok_seq) 
