@@ -58,10 +58,10 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nusc-root", required=True)
+    ap.add_argument("--nusc-root", default=None, help="nuScenes root directory (required for nuscenes/nuinteract datasets)")
     ap.add_argument("--version", default="v1.0-mini")
     ap.add_argument("--mode", choices=["distill", "lm"], default="lm")
-    ap.add_argument("--dataset", choices=["nuscenes", "nuinteract"], default="nuscenes")
+    ap.add_argument("--dataset", choices=["nuscenes", "nuinteract", "overlap_export"], default="nuscenes")
     ap.add_argument("--batch-size", type=int, default=1)  # keep 1; variable images per sample
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--captions", default=None)
     ap.add_argument("--prompt", default="", help="Optional text prompt prepended during LM fine-tuning/inference.")
     ap.add_argument("--nuinteract-dir", default=None, help="Directory that contains NuInteract dense caption JSON files.")
+    ap.add_argument("--overlap-export-dir", default=None, help="Path to dataset produced by export_overlap_dataset.py")
     ap.add_argument("--nuinteract-caption-strategy", choices=["overall", "per_view_concat"], default="overall",
                     help="How to combine NuInteract camera captions into a single target text.")
     ap.add_argument("--max-samples", type=int, default=None, help="Optional limit on dataset size (useful for smoke tests).")
@@ -90,8 +91,12 @@ def main():
     )
     args = ap.parse_args()
 
+    if args.dataset in {"nuscenes", "nuinteract"} and not args.nusc_root:
+        ap.error("--nusc-root is required for nuscenes/nuinteract datasets")
     if args.dataset == "nuinteract" and not args.nuinteract_dir:
         ap.error("--nuinteract-dir is required when --dataset nuinteract")
+    if args.dataset == "overlap_export" and not args.overlap_export_dir:
+        ap.error("--overlap-export-dir is required when --dataset overlap_export")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log(f"device={device} mode={args.mode} dataset={args.dataset} quant={args.qwen_quant}")
@@ -137,6 +142,7 @@ def main():
         nuinteract_caption_strategy=args.nuinteract_caption_strategy,
         max_samples=args.max_samples,
         require_files=args.require_files,
+        overlap_dir=args.overlap_export_dir,
     )
     log("Building dataset ...")
     ds = build_dataset(dcfg)

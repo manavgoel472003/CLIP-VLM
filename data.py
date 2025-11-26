@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DataCfg:
-    nusc_root: str
+    nusc_root: Optional[str]
     version: str = "v1.0-mini"
     cameras: Optional[List[str]] = None
     captions_json: Optional[str] = None
@@ -32,6 +32,7 @@ class DataCfg:
     nuinteract_caption_strategy: str = "overall"
     max_samples: Optional[int] = None
     require_files: bool = False
+    overlap_dir: Optional[str] = None
 
 
 def resolve_nusc_root(nusc_root: str, version: str) -> str:
@@ -52,6 +53,8 @@ class NuScenesMultiCamDataset(Dataset):
 
     def __init__(self, cfg: DataCfg):
         self.cfg = cfg
+        if not cfg.nusc_root:
+            raise ValueError("nusc_root must be provided for NuScenesMultiCamDataset.")
         self.nusc_root = resolve_nusc_root(cfg.nusc_root, cfg.version)
         self.nusc = NuScenes(version=cfg.version, dataroot=self.nusc_root, verbose=False)
         self.cams = cfg.cameras or list(DEFAULT_CAMERAS)
@@ -110,6 +113,8 @@ class NuInteractDenseCaptionDataset(Dataset):
     def __init__(self, cfg: DataCfg):
         if not cfg.nuinteract_dir:
             raise ValueError("nuinteract_dir must be set when dataset='nuinteract'.")
+        if not cfg.nusc_root:
+            raise ValueError("nusc_root must be provided for NuInteract dataset loading.")
         self.cfg = cfg
         self.cams = cfg.cameras or list(DEFAULT_CAMERAS)
         self.require_files = bool(cfg.require_files)
@@ -221,6 +226,9 @@ class NuInteractDenseCaptionDataset(Dataset):
         captions = row.get("gpt_caption")
         if captions:
             return captions
+        captions = row.get("gemini_caption")
+        if captions:
+            return captions
         return None
 
     def _build_caption(self, captions: Dict[str, str]) -> Optional[str]:
@@ -255,12 +263,75 @@ class NuInteractDenseCaptionDataset(Dataset):
         return {"images": images, "text": sample["text"], "token": sample["token"]}
 
 
+class ExportedOverlapDataset(Dataset):
+    """Dataset backed by export_overlap_dataset.py outputs (manifest + local JPGs)."""
+
+    def __init__(self, cfg: DataCfg):
+        if not cfg.overlap_dir:
+            raise ValueError("overlap_dir must be provided when dataset='overlap_export'.")
+        self.cfg = cfg
+        self.root = os.path.abspath(cfg.overlap_dir)
+        manifest_path = os.path.join(self.root, "manifest.json")
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(f"manifest.json missing under {self.root}")
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        requested_cams = cfg.cameras or manifest.get("cameras") or list(DEFAULT_CAMERAS)
+        samples = manifest.get("samples", [])
+        self.samples: List[Dict[str, Any]] = []
+        skipped = 0
+        for entry in samples:
+            images = entry.get("images", {})
+            img_paths: List[str] = []
+            missing = False
+            for cam in requested_cams:
+                rel = images.get(cam)
+                if not rel:
+                    missing = True
+                    break
+                abs_path = rel if os.path.isabs(rel) else os.path.join(self.root, rel)
+                if cfg.require_files and not os.path.exists(abs_path):
+                    missing = True
+                    break
+                img_paths.append(abs_path)
+            if missing or not img_paths:
+                skipped += 1
+                continue
+            caption = entry.get("caption")
+            self.samples.append(
+                {
+                    "token": entry.get("token"),
+                    "img_paths": img_paths,
+                    "text": caption.strip() if isinstance(caption, str) else None,
+                }
+            )
+            if cfg.max_samples and len(self.samples) >= cfg.max_samples:
+                break
+        if not self.samples:
+            raise RuntimeError(f"No usable samples found in exported dataset under {self.root}")
+        if skipped:
+            logger.info("Skipped %d exported samples missing requested cameras/files", skipped)
+        logger.info("Exported overlap dataset ready with %d samples", len(self.samples))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        sample = self.samples[idx]
+        images = [Image.open(p).convert("RGB") for p in sample["img_paths"] if os.path.exists(p)]
+        if not images:
+            raise FileNotFoundError(f"No images found for exported token {sample['token']}")
+        return {"images": images, "text": sample["text"], "token": sample["token"]}
+
+
 def build_dataset(cfg: DataCfg) -> Dataset:
     logger.info("Building dataset type=%s", cfg.dataset)
     if cfg.dataset == "nuscenes":
         ds = NuScenesMultiCamDataset(cfg)
     elif cfg.dataset == "nuinteract":
         ds = NuInteractDenseCaptionDataset(cfg)
+    elif cfg.dataset == "overlap_export":
+        ds = ExportedOverlapDataset(cfg)
     else:
         raise ValueError(f"Unsupported dataset type: {cfg.dataset}")
     logger.info("Dataset %s ready with %d samples", cfg.dataset, len(ds))
