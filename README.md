@@ -1,98 +1,49 @@
-# CLIP-VLM
+# Project Title : VLM for Perception using Car Camera Feed (CLIP-VLM)
 
-Fine-tune a CLIP + Qwen VLM on nuScenes surround cameras. Bring your own captions or use NuInteract’s dense ones. If you only grabbed part of nuScenes, flip a flag and we’ll skip missing images.
+## 1. What's Been done so far:
+- Created a dataset of camera images and caption pairs using NuScenes and NuInteract. This includes for now, CAM_FRONT and CAM_BACK along with joint caption for both.
+- Modified the Qwen VLM with a CLIP encoder so the model consumes fused multi-view features instead of a single built-in projector.
+- For training the modified model, we freeze the main strcuture and add PEFT LoRA adapter to the model, so we don't have to do a full fine-tune.
 
-## What’s going on
-- We run all chosen camera views through CLIP, fuse them, and project to Qwen’s hidden size.
-- Modes:  
-  - `distill`: match fused visuals to Qwen’s frozen vision tower (no text needed).  
-  - `lm`: teach the LLM to write captions for each sample.
-- We freeze CLIP and base Qwen; only the connector (and LoRA layers if you enable them) trains.
-- `--prompt` gets prepended to every target caption in LM mode so you can steer tone.
+## 2. Planned modules:
+| Module | Status | Description |
+| --- | --- | --- |
+| Data pipeline (`data.py`) | Fully Functional | Loads the images to PIL for each sample and its corresponding joint caption from the manifest |
+| Model (`model.py`) | Fully Functional | This consists of the modified architecture, the Fusion Connector takes the CLIP features and projects them to Qwen's hidden size, and then corss-attends to Qwen's tokens with a gated residual. |
+| Training (`training.py`) | Partially Functional | Currently the model is being trained, on a small amount of epochs to produce similar captions, like those in nuInteract.  |
+| Inference | Development Phase | Still figuriing out what sort of prompts to hard-code based on the trained model to get best results out of it |
 
-## Data setup (keep it light)
-- nuScenes folder needs `samples/`, `sweeps/`, `maps/`, and a `v1.0-*` metadata folder.
-- Missing blobs? Add `--require-files` to drop any sample missing a requested camera image.
-- Pick cameras with `--cameras` (defaults to all 6 surround).
-- Your captions (nuScenes): JSON mapping `sample_token -> text` via `--captions`. Samples without captions are skipped in LM mode.
+## 3. Baseline module descriptions :
+- **Model :**
+  1. Each requested camera image (currently `CAM_FRONT` and `CAM_BACK`) is pushed through frozen OpenCLIP ViT-L/14. We keep one token per view, preserving directional cues like “front windshield” vs. “rear traffic.”
+  2.  The stacked CLIP tokens are projected into Qwen’s hidden size, passed through shallow Transformer layers, and then attended to by Qwen’s visual prefix via a multi-head attention block with a learnable gate. The gate basically decides how strongly the fused vision overwrites Qwen’s frozen activations.
+  3. Qwen’s backbone stays frozen, but LoRA adapters wrap the attention/MLP weights so a few million parameters can adapt. Combined with the connector, this is the only trainable path, keeping VRAM usage low.
+  4. **Key path in code:**
+     ```python
+     q = self.teacher_tokens(images).to(self.cfg.device, dtype=target_dtype)
+     e = self.ext_tokens(images).to(self.cfg.device, dtype=target_dtype)
+     fused = self.connector(q, e)
+     ```
+     `teacher_tokens` captures Qwen’s frozen visual activations, `ext_tokens` holds CLIP features, and `self.connector` learns to align the two spaces before language generation.
+- **Training :**
+  1. For training we concatenate `[fused visual tokens, prompt embeddings, target caption embeddings]` and feed them into Qwen via `inputs_embeds`..
+  3. Only the Fusion Connector weights and LoRA adapter matrices receive gradients; CLIP and the frozen Qwen backbone remain untouched.
+  4. **How step training is done : **
+     ```python
+     # training.py 
+     out = model.lm_step(images, prompt=prompt, labels_text=text)
+     loss = out.loss          # cross-entropy over caption tokens only
+     loss.backward()
+     nn.utils.clip_grad_norm_(model.connector.parameters(), 1.0)
+     opt.step()
+     ```
+     `lm_step` handles the concatenation/masking internally, and the trainer updates only the lightweight components after gradient clipping.
 
-## NuInteract (DriveMonkey) captions
-- Point `--nuinteract-dir` at `all_caption_public/`.
-- GPT-only: we read `gpt_caption` fields and ignore others. Rows without GPT captions are skipped.
-- Strategies (`--nuinteract-caption-strategy`):  
-  - `overall` (default): use `OVERALL` plus FRONT/BACK snippets.  
-  - `per_view_concat`: glue per-camera captions in the order of `--cameras`; if none, fall back to `OVERALL`.
-- With `--require-files`, any sample missing a requested JPG is dropped.
 
-### Export just the overlap (front/back + GPT/Gemini captions)
-Need the NuInteract/nuScenes intersection as a self-contained folder? Use `export_overlap_dataset.py` to copy only the overlapping tokens, front/back camera JPGs, and GPT captions:
-```bash
-uv run python export_overlap_dataset.py \
-  --nusc-root /path/to/nuscenes \
-  --version v1.0-mini \
-  --nuinteract-dir /path/to/all_caption_public \
-  --output-dir /tmp/nu_overlap_front_back \
-  --require-files \
-  --overwrite
-```
-- Defaults to copying `CAM_FRONT` and `CAM_BACK`; pass `--cameras` to change the views.
-- Output layout: `images/<token>/CAM_FRONT.jpg`, `images/<token>/CAM_BACK.jpg`, plus `captions.json` and `manifest.json` (combined/front/back GPT text only).
-- Use `--max-samples` for a quick sanity check before exporting the full set.
+## 4. Challenges :
+- The major challenge faced has been resources for fine-tuning the model as doing so requires high end A100 from google colab right now.
+- The other issue is not having enough data, as using more data would require more resources. But, using frozen weights and fine-tuning can help counter some of that as we have pre-trained performance of some level.
 
-## Train from exported overlap (no nuScenes tree needed)
-After exporting the overlap folder (contains `images/`, `manifest.json`, `captions.json`), you can train directly on it:
-```bash
-uv run python training.py \
-  --dataset overlap_export \
-  --overlap-export-dir /path/to/overlap_front_back_trainval \
-  --mode lm \
-  --epochs 3 \
-  --prompt "Describe the scene." \
-  --max-samples 100  # optional smoke test
-```
-- Leave `--nusc-root` unset for this mode; manifests already include image paths.
-- `--cameras` defaults to the manifest order, but you can override if you only want a subset.
-
-Want to run everything on Colab? See `COLAB_TRAINING.md` for a cell-by-cell walkthrough (GPU runtime setup, installing from `pyproject.toml`, copying the exported dataset via Drive, and saving checkpoints back to Drive).
-
-## Training flow (plain version)
-1) Configure: dataset (`nuscenes|nuinteract`), version (`v1.0-mini|v1.0-trainval`), cameras, prompt, and `--require-files` if you’re on partial blobs.  
-2) Build dataset (`data.py`): resolve image paths, check files if asked, build one caption string per sample using the chosen strategy.  
-3) Init model (`model.py`): CLIP + Qwen; optional quant (`--qwen-quant bnb-8bit|bnb-4bit`) and LoRA (`--use-lora`).  
-4) Train (`training.py`):  
-   - `distill`: Smooth L1 + cosine between fused tokens and teacher vision tokens.  
-   - `lm`: cross-entropy on the caption (with prompt prepended).  
-   - Batch size 1 (variable number of images).  
-5) Save: connector weights + metadata go to `--save`.
-
-## Quick commands
-nuScenes with your captions:
-```bash
-uv run python training.py \
-  --dataset nuscenes \
-  --nusc-root /path/to/nuscenes \
-  --version v1.0-mini \
-  --captions /path/to/captions.json \
-  --mode lm \
-  --prompt "You are the driver. Reply with the next safe instruction." \
-  --epochs 3
-```
-
-NuInteract GPT captions (partial trainval is fine):
-```bash
-uv run python training.py \
-  --dataset nuinteract \
-  --nusc-root /path/to/nuscenes \
-  --version v1.0-trainval \
-  --nuinteract-dir /path/to/all_caption_public \
-  --nuinteract-caption-strategy per_view_concat \
-  --cameras CAM_FRONT CAM_FRONT_RIGHT CAM_BACK_RIGHT CAM_BACK CAM_BACK_LEFT CAM_FRONT_LEFT \
-  --require-files \
-  --mode lm \
-  --epochs 3
-```
-
-## Handy flags
-- `--require-files`: drop samples missing any requested camera image (use this with partial blobs).
-- `--max-samples N`: quick smoke test.
-- `--qwen-quant bnb-8bit|bnb-4bit`: trims VRAM; pairs well with `--use-lora`.
+## 5. What's left to do :
+- Currently each epoch with on a 3000 sample dataset takes ~1.5 hrs, and we have only been able to train 5 epochs, which are yet to be tested.
+- So, testing the current fine-tuned version against base model is the priority and then train for additional epochs to get hopefully better results.
