@@ -28,7 +28,7 @@
 - **Training :**
   1. For training we concatenate `[fused visual tokens, prompt embeddings, target caption embeddings]` and feed them into Qwen via `inputs_embeds`..
   3. Only the Fusion Connector weights and LoRA adapter matrices receive gradients; CLIP and the frozen Qwen backbone remain untouched.
-  4. **How step training is done : **
+  4. **How step training is done :**
      ```python
      # training.py 
      out = model.lm_step(images, prompt=prompt, labels_text=text)
