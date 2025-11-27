@@ -1,5 +1,7 @@
 # Project Title : VLM for Perception using Car Camera Feed (CLIP-VLM)
 
+`This is the project milestone report for ISA project.`
+
 ## 1. What's Been done so far:
 - Created a dataset of camera images and caption pairs using NuScenes and NuInteract. This includes for now, CAM_FRONT and CAM_BACK along with joint caption for both.
 - Modified the Qwen VLM with a CLIP encoder so the model consumes fused multi-view features instead of a single built-in projector.
@@ -47,3 +49,9 @@
 ## 5. What's left to do :
 - Currently each epoch with on a 3000 sample dataset takes ~1.5 hrs, and we have only been able to train 5 epochs, which are yet to be tested.
 - So, testing the current fine-tuned version against base model is the priority and then train for additional epochs to get hopefully better results.
+
+## References
+- nuScenes dataset & SDK:(https://www.nuscenes.org/).
+- NuInteract dense captions: (public release at https://drive.google.com/drive/folders/1G7dlA0-8LZqYbO4k6G0bczwrt8sR6uH0).
+- Qwen/Qwen2.5-VL-3B-Instruct: (https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct).
+- LoRA/PEFT adapters: (https://arxiv.org/abs/2106.09685).
