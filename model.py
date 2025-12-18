@@ -28,15 +28,7 @@ class ModelCfg:
     n_layers: int = 1
     gate_init: float = 0.5
 
-    ego_prompt: str = """Predict ego motion from time t to t+1 (dt ~ 0.5 s) in the VEHICLE frame.
-        Coordinates: x_forward > 0 forward, y_left > 0 left, yaw_rad > 0 counterclockwise.
-        Use and fuse all available cameras.
-        Prioritize static scene geometry and parallax (lane markings, curb edges, poles, buildings, road texture).
-        Ignore moving agents except for their parallax contribution.
-        Prefer near-field ground-plane cues; de-emphasize sky and horizon.
-        Assume motion constrained to the road plane (dz = 0).
-        Output targets (internal): dx_m, dy_m, dyaw_rad. Units: meters, radians. Keep signs consistent.
-        Bias toward small-magnitude precision and robustness to low light, rain, glare, and partial occlusion.
+    ego_prompt: str = """Describe the scene in detail."
     """
 
     use_lora: bool = False
