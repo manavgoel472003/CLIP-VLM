@@ -9,7 +9,7 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 try:
     from transformers import BitsAndBytesConfig
-except ImportError:
+except ImportError:  # pragma: no cover - optional dep pre-4.30
     BitsAndBytesConfig = None
 import open_clip
 
@@ -22,7 +22,7 @@ class ModelCfg:
     qdtype: torch.dtype = torch.bfloat16
     clip_arch: str = "ViT-L-14"
     clip_ckpt: str = "openai"
-    qwen_quant: str = "bnb-4bit"
+    qwen_quant: str = "bnb-4bit"  # choices: none, bnb-8bit, bnb-4bit
 
     n_heads: int = 8
     n_layers: int = 1
@@ -63,9 +63,9 @@ class CLIPBackbone(nn.Module):
         feats = []
         for im in images:
             t = self.preproc(im.convert("RGB")).unsqueeze(0).to(device)
-            f = self.model.encode_image(t)
+            f = self.model.encode_image(t)  # (1, d)
             feats.append(f)
-        return torch.cat(feats, dim=0)
+        return torch.cat(feats, dim=0)  # (N, d)
     
 class VisualTokenCatcher:
     def __init__(self, d_model: int):
@@ -92,7 +92,7 @@ class VisualTokenCatcher:
         if not self.cands:
             raise RuntimeError("No (B,T,d) activations captured. Visual projector not found.")
         best = max(self.cands, key=lambda x: x[0].shape[1])
-        return best[0]
+        return best[0]  # (B, T, d)
 
 
 class QwenVisionExtractor(nn.Module):
@@ -144,10 +144,13 @@ class QwenVisionExtractor(nn.Module):
         inputs = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
         _ = self.model(**inputs)
         catcher.detach()
-        vt = catcher.pick()
+        vt = catcher.pick()  # (1, T, d)
         return vt
     
 class FusionConnector(nn.Module):
+    """Project external tokens -> d_model, then cross-attend from Qwen tokens to external tokens.
+       Output has shape (B, Tq, d_model). Only this module is trained for fusion.
+    """
     def __init__(self, d_ext: int, d_model: int, n_heads: int = 8, n_layers: int = 1, gate_init: float = 0.5):
         super().__init__()
         self.in_proj = nn.Linear(d_ext, d_model)
@@ -164,7 +167,7 @@ class FusionConnector(nn.Module):
         self.gate = nn.Parameter(torch.full((1, 1, d_model), gate_init))
 
     def forward(self, qwen_tokens: torch.Tensor, ext_tokens: torch.Tensor) -> torch.Tensor:
-        x = self.in_norm(self.in_proj(ext_tokens))
+        x = self.in_norm(self.in_proj(ext_tokens))  # (B, Te, d)
         for blk in self.blocks:
             x = blk(x)
         Q = self.q_proj(qwen_tokens)
@@ -199,30 +202,31 @@ class VLMFusionModel(nn.Module):
 
     @torch.no_grad()
     def teacher_tokens(self, images: List[Image.Image]) -> torch.Tensor:
-        return self.qwen.visual_tokens(images)
+        return self.qwen.visual_tokens(images)  # (1, T, d)
 
     @torch.no_grad()
     def ext_tokens(self, images: List[Image.Image]) -> torch.Tensor:
-        feats = self.ext.encode_many(images, device=self.cfg.device)
-        return feats.unsqueeze(0)
+        feats = self.ext.encode_many(images, device=self.cfg.device)  # (N, d_ext)
+        return feats.unsqueeze(0)  # (1, Te, d_ext)
 
     def fused_tokens(self, images: List[Image.Image]) -> torch.Tensor:
         with torch.no_grad():
             target_dtype = self.connector.in_proj.weight.dtype
-            q = self.teacher_tokens(images).to(self.cfg.device, dtype=target_dtype)
-            e = self.ext_tokens(images).to(self.cfg.device, dtype=target_dtype)
+            q = self.teacher_tokens(images).to(self.cfg.device, dtype=target_dtype)  # (1, Tq, d)
+            e = self.ext_tokens(images).to(self.cfg.device, dtype=target_dtype)      # (1, Te, d_ext)
             max_vis = self.cfg.max_vis_tokens
             if max_vis is not None and max_vis > 0 and q.size(1) > max_vis:
                 q = q[:, :max_vis, :]
-        return self.connector(q, e)
+        return self.connector(q, e)  # (1, Tq, d)
 
     def llm_vis_hidden(self, images: List[Image.Image], prompt: Optional[str] = None):
-        fused = self.fused_tokens(images)
+        """Run the LLM on [fused visual prefix ; prompt] and return final hidden states + visual length."""
+        fused = self.fused_tokens(images)  # (1, T_vis, d)
         T_vis = fused.size(1)
         txt = (self.cfg.ego_prompt if prompt is None else prompt)
         enc = self.tok(txt, return_tensors="pt").to(self.cfg.device)
         if enc["input_ids"].numel() > 0:
-            text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])
+            text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])  # (1, T_txt, d)
             inputs_embeds = torch.cat([fused, text_emb], dim=1)
         else:
             inputs_embeds = fused
@@ -234,28 +238,38 @@ class VLMFusionModel(nn.Module):
             use_cache=False,
             return_dict=True,
         )
-
+        # For causal LMs in HF, hidden_states is a tuple of layer outputs; take the last
         hidden = out.hidden_states[-1] if isinstance(out.hidden_states, (list, tuple)) else out.last_hidden_state
         return hidden, T_vis
     
     def lm_step(self, images: List[Image.Image], prompt: str, labels_text: Optional[str] = None):
-        fused = self.fused_tokens(images)
+        fused = self.fused_tokens(images)  # (1, T, d)
         enc = self.tok(prompt, return_tensors="pt").to(self.cfg.device)
-        text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])
-        inputs_embeds = torch.cat([fused, text_emb], dim=1)
+        text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])  # (1, Tt, d)
+        target_dtype = self.gen_model.lm_head.weight.dtype
+        fused = fused.to(self.cfg.device, dtype=target_dtype)
+        text_emb = text_emb.to(self.cfg.device, dtype=target_dtype)
+        pieces = [fused, text_emb]
+        label_ids = None
+        if labels_text is not None:
+            label_tok = self.tok(labels_text, return_tensors="pt").to(self.cfg.device)
+            label_ids = label_tok["input_ids"]
+            label_emb = self.gen_model.get_input_embeddings()(label_ids).to(self.cfg.device, dtype=target_dtype)
+            pieces.append(label_emb)
+        inputs_embeds = torch.cat(pieces, dim=1)
         attn_mask = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long, device=self.cfg.device)
         if labels_text is None:
             return self.gen_model(inputs_embeds=inputs_embeds, attention_mask=attn_mask)
         else:
-            lab = self.tok(labels_text, return_tensors="pt").to(self.cfg.device)["input_ids"]
-            pad = torch.full((lab.size(0), fused.size(1)), -100, device=lab.device)
-            labels = torch.cat([pad, lab], dim=1)
+            pad_len = fused.size(1) + text_emb.size(1)
+            pad = torch.full((label_ids.size(0), pad_len), -100, device=label_ids.device)
+            labels = torch.cat([pad, label_ids], dim=1)
             return self.gen_model(inputs_embeds=inputs_embeds, attention_mask=attn_mask, labels=labels)
 
     def generate(self, images: List[Image.Image], prompt: str, max_new_tokens: int = 128) -> str:
         fused = self.fused_tokens(images)
         enc = self.tok(prompt, return_tensors="pt").to(self.cfg.device)
-        text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])
+        text_emb = self.gen_model.get_input_embeddings()(enc["input_ids"])  # (1, Tt, d)
         inputs_embeds = torch.cat([fused, text_emb], dim=1)
         attn_mask = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long, device=self.cfg.device)
         out_ids = self.gen_model.generate(inputs_embeds=inputs_embeds, attention_mask=attn_mask,

@@ -6,6 +6,7 @@ os.environ["MPLBACKEND"] = "Agg"
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,18 +19,64 @@ logger = logging.getLogger(__name__)
 
 def log(msg: str, level: int = logging.INFO):
     logger.log(level, msg)
+def _ensure_batch(batch):
+    if isinstance(batch, list):
+        return batch
+    return [batch]
 
-def lm_epoch(model: VLMFusionModel, loader, opt, device: str, prompt: str):
+
+def _pad_embeddings(seq_list, device):
+    if not seq_list:
+        raise ValueError("Cannot pad empty sequence list.")
+    max_len = max(seq.size(0) for seq in seq_list)
+    d = seq_list[0].size(1)
+    dtype = seq_list[0].dtype
+    padded = torch.zeros(len(seq_list), max_len, d, device=device, dtype=dtype)
+    mask = torch.zeros(len(seq_list), max_len, device=device, dtype=torch.long)
+    for i, seq in enumerate(seq_list):
+        L = seq.size(0)
+        padded[i, :L, :] = seq
+        mask[i, :L] = 1
+    return padded, mask
+
+
+def _pad_labels(label_list, device, pad_value=-100):
+    max_len = max(lbl.size(0) for lbl in label_list)
+    dtype = label_list[0].dtype
+    padded = torch.full((len(label_list), max_len), pad_value, device=device, dtype=dtype)
+    for i, lbl in enumerate(label_list):
+        L = lbl.size(0)
+        padded[i, :L] = lbl
+    return padded
+
+
+def distill_epoch(model: VLMFusionModel, loader, opt, device: str):
     model.train()
     total = 0.0
     steps = 0
-    for batch in tqdm(loader, desc="lm"):
-        images, text = batch["images"], batch["text"]
-        if text is None:
+    for batch in tqdm(loader, desc="distill"):
+        samples = _ensure_batch(batch)
+        fused_list = []
+        teacher_list = []
+        for sample in samples:
+            images = sample["images"]
+            with torch.no_grad():
+                teacher = model.teacher_tokens(images).to(device).squeeze(0)
+            fused = model.fused_tokens(images).squeeze(0).to(device)
+            L = min(fused.size(0), teacher.size(0))
+            if L == 0:
+                continue
+            fused_list.append(fused[:L])
+            teacher_list.append(teacher[:L])
+        if not fused_list:
             continue
-        out = model.lm_step(images, prompt=prompt, labels_text=text)
-        loss = out.loss
         opt.zero_grad()
+        fused_pad, mask = _pad_embeddings(fused_list, device)
+        teacher_pad, _ = _pad_embeddings(teacher_list, device)
+        mask = mask.unsqueeze(-1).float()
+        diff = fused_pad - teacher_pad
+        denom = mask.sum().clamp_min(1.0)
+        loss = F.smooth_l1_loss(diff * mask, torch.zeros_like(diff), reduction="sum") / denom
         loss.backward()
         nn.utils.clip_grad_norm_(model.connector.parameters(), 1.0)
         opt.step()
@@ -38,6 +85,48 @@ def lm_epoch(model: VLMFusionModel, loader, opt, device: str, prompt: str):
     return total / max(1, steps)
 
 
+def lm_epoch(model: VLMFusionModel, loader, opt, device: str, prompt: str):
+    model.train()
+    total = 0.0
+    steps = 0
+    embed_layer = model.gen_model.get_input_embeddings()
+    target_dtype = model.gen_model.lm_head.weight.dtype
+    for batch in tqdm(loader, desc="lm"):
+        samples = _ensure_batch(batch)
+        embed_list = []
+        label_list = []
+        for sample in samples:
+            text = sample["text"]
+            if not text:
+                continue
+            images = sample["images"]
+            fused = model.fused_tokens(images).squeeze(0).to(device, dtype=target_dtype)
+            prompt_ids = model.tok(prompt, return_tensors="pt").to(device)["input_ids"].squeeze(0)
+            prompt_emb = embed_layer(prompt_ids.unsqueeze(0)).squeeze(0).to(device, dtype=target_dtype)
+            label_tokens = model.tok(text, return_tensors="pt").to(device)["input_ids"].squeeze(0)
+            label_emb = embed_layer(label_tokens.unsqueeze(0)).squeeze(0).to(device, dtype=target_dtype)
+            inputs = torch.cat([fused, prompt_emb, label_emb], dim=0)
+            labels = torch.cat([
+                torch.full((fused.size(0) + prompt_emb.size(0),), -100, device=device, dtype=label_tokens.dtype),
+                label_tokens,
+            ], dim=0)
+            embed_list.append(inputs)
+            label_list.append(labels)
+        if not embed_list:
+            continue
+        opt.zero_grad()
+        embeds_padded, attn_mask = _pad_embeddings(embed_list, device)
+        labels_padded = _pad_labels(label_list, device, pad_value=-100)
+        out = model.gen_model(inputs_embeds=embeds_padded, attention_mask=attn_mask, labels=labels_padded)
+        loss = out.loss
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.connector.parameters(), 1.0)
+        opt.step()
+        total += loss.item()
+        steps += 1
+    return total / max(1, steps)
+
+# Yet to add
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -46,8 +135,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nusc-root", default=None, help="nuScenes root directory (required for nuscenes/nuinteract datasets)")
     ap.add_argument("--version", default="v1.0-mini")
+    ap.add_argument("--mode", choices=["distill", "lm"], default="lm")
     ap.add_argument("--dataset", choices=["nuscenes", "nuinteract", "overlap_export"], default="nuscenes")
-    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--batch-size", type=int, default=1)  # keep 1; variable images per sample
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=1e-2)
@@ -92,7 +182,7 @@ def main():
     log("LoRA fine-tuning enabled for Qwen (mandatory).")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"device={device} dataset={args.dataset} quant={args.qwen_quant}")
+    log(f"device={device} mode={args.mode} dataset={args.dataset} quant={args.qwen_quant}")
 
     mcfg = ModelCfg(
         device=device,
@@ -105,12 +195,12 @@ def main():
     log("Model instantiated (vision + language backbones ready)")
 
 
-
+    # Freeze pre-trained backbones + LLM
     for p in model.qwen.parameters(): p.requires_grad = False
     for p in model.ext.parameters():  p.requires_grad = False
 
     if args.use_lora:
-
+        # freeze base LM weights but leave LoRA trainable
         for n, p in model.gen_model.named_parameters():
             if "lora_" in n: 
                 p.requires_grad = True
@@ -119,7 +209,7 @@ def main():
     else:
         for p in model.gen_model.parameters(): p.requires_grad = False
 
-
+    # Optimizers
     train_params = list(model.connector.parameters())
     if args.use_lora:
         train_params += [p for n,p in model.gen_model.named_parameters() if p.requires_grad]
@@ -141,7 +231,7 @@ def main():
     log("Building dataset ...")
     ds = build_dataset(dcfg)
     log(f"Dataset built with {len(ds)} samples")
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=lambda x: x[0])
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=lambda x: x)
     log(f"DataLoader ready (batch_size={args.batch_size})")
 
     def build_payload():
@@ -151,6 +241,7 @@ def main():
             "d_model": model.qwen.d_model,
             "version": args.version,
             "qwen_id": mcfg.qwen_id,
+            "mode": args.mode,
             "prompt": args.prompt,
         }
 
@@ -159,14 +250,17 @@ def main():
 
     for ep in range(1, args.epochs + 1):
         log(f"Starting epoch {ep}/{args.epochs}")
-        loss = lm_epoch(model, loader, opt, device, prompt=args.prompt)
+        if args.mode == "distill":
+            loss = distill_epoch(model, loader, opt, device)
+        else:
+            loss = lm_epoch(model, loader, opt, device, prompt=args.prompt)
         log(f"Epoch {ep} loss: {loss:.4f}")
         if args.checkpoint_dir:
             ckpt_path = os.path.join(args.checkpoint_dir, f"connector_epoch{ep}.pt")
             torch.save(build_payload(), ckpt_path)
             log(f"Saved epoch {ep} checkpoint to {ckpt_path}")
 
-
+    # Save
     torch.save(build_payload(), args.save)
     log(f"Saved checkpoint to {args.save}")
 

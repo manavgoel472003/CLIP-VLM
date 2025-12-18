@@ -134,7 +134,7 @@ class NuInteractDenseCaptionDataset(Dataset):
         for path in json_files:
             try:
                 data = json.load(open(path))
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Failed to load %s: %s", path, exc)
                 continue
             for row in data:
