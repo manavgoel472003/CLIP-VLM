@@ -1,7 +1,5 @@
 # Project Title : VLM for Perception using Car Camera Feed (CLIP-VLM)
 
-`This is the project milestone report for ISA project.`
-
 ## 1. What's Been done so far:
 - Created a dataset of camera images and caption pairs using NuScenes and NuInteract. This includes for now, CAM_FRONT and CAM_BACK along with joint caption for both.
 - Modified the Qwen VLM with a CLIP encoder so the model consumes fused multi-view features instead of a single built-in projector.
